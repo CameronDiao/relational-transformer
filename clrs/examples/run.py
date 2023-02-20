@@ -1,20 +1,3 @@
-# Copyright 2021 DeepMind Technologies Limited. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-
-"""Run a full test run for one or more algorithmic tasks from CLRS."""
-
 import os
 import shutil
 import time
@@ -24,27 +7,39 @@ from absl import flags
 from absl import logging
 
 import clrs
+from clrs._src import specs
 import jax
 import jax.numpy as jnp
 import requests
 import tensorflow as tf
 
+
 flags.DEFINE_string('algorithm', 'jarvis_march', 'Which algorithm to run.')
+flags.DEFINE_integer('train_seed', 1, 'Seed train set generation.')
+flags.DEFINE_integer('valid_seed', 2, 'Seed validation set generation.')
+flags.DEFINE_integer('test_seed', 3, 'Seed test set generation.')
 flags.DEFINE_integer('model_seed', 42, 'Seed model initialization.')
 
 flags.DEFINE_integer('batch_size', 4, 'Batch size used for training.')
+flags.DEFINE_integer('eval_batch_size', 1, 'Batch size used for evaluation.')
 flags.DEFINE_string('chunked_training', 'False',
                     'Whether to use chunking for training.')
 flags.DEFINE_integer('chunk_length', 100,
                      'Time chunk length used for training (if '
                      '`chunked_training` is True.')
-flags.DEFINE_integer('train_items', 320000,
+flags.DEFINE_integer('train_items', 320,
                      'Number of items (i.e., individual examples, possibly '
                      'repeated) processed during training. With non-chunked'
                      'training, this is the number of training batches times '
                      'the number of training steps. For chunked training, '
                      'as many chunks will be processed as needed to get these '
                      'many full examples.')
+flags.DEFINE_integer('train_size', 320000,
+                      'Number of samples in the training set.')
+flags.DEFINE_integer('valid_size', 32,
+                     'Number of samples in the validation set.')
+flags.DEFINE_integer('test_size', 32,
+                     'Number of samples in the test set.')
 flags.DEFINE_integer('eval_every', 320,
                      'Logging frequency (in training examples).')
 flags.DEFINE_string('eval_on_train_set', 'True',
@@ -52,7 +47,9 @@ flags.DEFINE_string('eval_on_train_set', 'True',
 flags.DEFINE_string('eval_on_test_set', 'True',
                     'Whether to evaluate the model on the test dataset.')
 flags.DEFINE_string('verbose_logging', 'False', 'Whether to log aux losses.')
+flags.DEFINE_string('log_param_count', 'False', 'Whether to log number of model parameters')
 flags.DEFINE_string('ptr_from_edges', 'True', 'Whether to decode pointers directly from edge vectors.')
+flags.DEFINE_string('disable_edge_updates', 'False', 'Whether to disable edge updates')
 
 flags.DEFINE_integer('num_layers', 3, 'Number of processor layers.')
 flags.DEFINE_integer('hidden_size', 0,
@@ -103,8 +100,8 @@ flags.DEFINE_enum(
 
 flags.DEFINE_string('checkpoint_path', '/tmp/CLRS30',
                     'Path in which checkpoints are saved.')
-flags.DEFINE_string('dataset_path', '/tmp/CLRS30',
-                    'Path in which dataset is stored.')
+# flags.DEFINE_string('dataset_path', '/tmp/CLRS30',
+#                     'Path in which dataset is stored.')
 flags.DEFINE_string('freeze_processor', 'False',
                     'Whether to freeze the processor of the model.')
 
@@ -161,7 +158,10 @@ def collect_and_eval(sampler, predict_fn, sample_count, rng_key, spec, extras):
   hints = []
   lengths = []
   while processed_samples < sample_count:
-    feedback = next(sampler)
+    try:
+      feedback = next(sampler)
+    except TypeError as te:
+      feedback = sampler.next(FLAGS.eval_batch_size, eval=True)
     outputs.append(feedback.outputs)
     rng_key, new_rng_key = jax.random.split(rng_key)
     cur_preds, (cur_hint_preds, _, _) = predict_fn(rng_key, feedback.features)
@@ -171,7 +171,8 @@ def collect_and_eval(sampler, predict_fn, sample_count, rng_key, spec, extras):
       lengths.append(feedback.features.lengths)
       hint_preds.append(cur_hint_preds)
     rng_key = new_rng_key
-    processed_samples += FLAGS.batch_size
+    processed_samples += FLAGS.eval_batch_size
+  sampler.reset_proc_samples()
   outputs = _concat(outputs, axis=0)
   preds = _concat(preds, axis=0)
   if verbose:
@@ -209,18 +210,23 @@ def save_stats(obj, filename):
 
 def main(unused_argv):
   # Use canonical CLRS-30 samplers.
-  dataset_folder = maybe_download_dataset()
+  # dataset_folder = maybe_download_dataset()
 
   FLAGS.chunked_training = eval(FLAGS.chunked_training)
   FLAGS.eval_on_train_set = eval(FLAGS.eval_on_train_set)
   FLAGS.eval_on_test_set = eval(FLAGS.eval_on_test_set)
   FLAGS.verbose_logging = eval(FLAGS.verbose_logging)
+  FLAGS.log_param_count = eval(FLAGS.log_param_count)
   FLAGS.ptr_from_edges = eval(FLAGS.ptr_from_edges)
+  FLAGS.disable_edge_updates = eval(FLAGS.disable_edge_updates)
   FLAGS.use_ln = eval(FLAGS.use_ln)
   FLAGS.use_lstm = eval(FLAGS.use_lstm)
   FLAGS.freeze_processor = eval(FLAGS.freeze_processor)
 
-  if 'rt' in FLAGS.processor_type or 'gat' in FLAGS.processor_type:
+  if 'gat' in FLAGS.processor_type or \
+      FLAGS.processor_type == 'rt' or \
+      FLAGS.processor_type == 'rtv2' or \
+      FLAGS.processor_type == 'pt':
     FLAGS.hidden_size = FLAGS.nb_heads * FLAGS.head_size
 
   if FLAGS.hint_mode == 'encoded_decoded_nodiff':
@@ -246,9 +252,9 @@ def main(unused_argv):
   else:
     raise ValueError('Hint mode not in {encoded_decoded, decoded_only, none}.')
 
-  common_args = dict(folder=dataset_folder,
-                     algorithm=FLAGS.algorithm,
-                     batch_size=FLAGS.batch_size)
+  #common_args = dict(folder=dataset_folder,
+  #                   algorithm=FLAGS.algorithm,
+  #                   batch_size=FLAGS.batch_size)
   # Make full dataset pipeline run on CPU (including prefetching).
   with tf.device('/cpu:0'):
     if FLAGS.chunked_training:
@@ -258,16 +264,71 @@ def main(unused_argv):
           split='train', **common_args)
       train_sampler_for_eval = train_sampler_for_eval.as_numpy_iterator()
     else:
-      train_sampler, _, spec = clrs.create_dataset(**common_args, split='train')
-      train_sampler = train_sampler.as_numpy_iterator()
+      #train_sampler, _, spec = clrs.create_dataset(**common_args, split='train')
+      #train_sampler = train_sampler.as_numpy_iterator()
       train_sampler_for_eval = None
+      train_sampler, spec = clrs.build_sampler(
+          name=FLAGS.algorithm,
+          seed=FLAGS.train_seed,
+          num_samples=FLAGS.train_size,
+          length=16)
 
-    val_sampler, val_samples, _ = clrs.create_dataset(
-        **common_args, split='val')
-    val_sampler = val_sampler.as_numpy_iterator()
-    test_sampler, test_samples, _ = clrs.create_dataset(
-        **common_args, split='test')
-    test_sampler = test_sampler.as_numpy_iterator()
+    #val_sampler, val_samples, _ = clrs.create_dataset(
+    #    **common_args, split='val')
+    #val_sampler = val_sampler.as_numpy_iterator()
+    #test_sampler, test_samples, _ = clrs.create_dataset(
+    #    **common_args, split='test')
+    #test_sampler = test_sampler.as_numpy_iterator()
+
+    # val_samples = 32
+    # val_sampler, _ = clrs.build_sampler(
+    #     name=FLAGS.algorithm,
+    #     seed=FLAGS.seed + 1,
+    #     num_samples=32,
+    #     length=16)
+
+    val_samples = FLAGS.valid_size * specs.CLRS_30_ALGS_SETTINGS[FLAGS.algorithm][
+          'num_samples_multiplier']
+
+    test_samples = FLAGS.test_size * specs.CLRS_30_ALGS_SETTINGS[FLAGS.algorithm][
+          'num_samples_multiplier']
+
+    if FLAGS.algorithm == 'find_maximum_subarray_kadane':
+      val_samples = 1024
+      test_samples = 1024
+    elif FLAGS.algorithm == 'quickselect' or \
+        FLAGS.algorithm == 'minimum' or \
+        FLAGS.algorithm == 'binary_search' or \
+        FLAGS.algorithm == 'naive_string_matcher' or \
+        FLAGS.algorithm == 'kmp_matcher' or \
+        FLAGS.algorithm == 'segments_intersect':
+      val_samples = 2048
+      test_samples = 2048
+
+    val_sampler, _ = clrs.build_sampler(
+        name=FLAGS.algorithm,
+        seed=FLAGS.valid_seed,
+        num_samples=val_samples,
+        length=16
+    )
+
+    # test_samples = 32
+    # test_sampler, _ = clrs.build_sampler(
+    #     name=FLAGS.algorithm,
+    #     seed=FLAGS.seed + 2,
+    #     num_samples=32,
+    #     length=64)
+
+    
+    test_sampler, _ = clrs.build_sampler(
+        name=FLAGS.algorithm,
+        seed=FLAGS.test_seed,
+        num_samples=test_samples,
+        length=64
+    )
+
+    logging.info('train_samples: {}, val samples: {}, test samples: {}'.format(FLAGS.train_size,
+        val_samples, test_samples))
 
   processor_factory = clrs.get_processor_factory(FLAGS.processor_type,
                                                  use_ln=FLAGS.use_ln,
@@ -276,8 +337,8 @@ def main(unused_argv):
                                                  node_hid_size=FLAGS.node_hid_size,
                                                  edge_hid_size_1=FLAGS.edge_hid_size_1,
                                                  edge_hid_size_2=FLAGS.edge_hid_size_2,
-                                                 disable_edge_updates=FLAGS.ptr_from_edges,
-                                                 graph_vec=FLAGS.graph_vec)
+                                                 graph_vec=FLAGS.graph_vec,
+                                                 disable_edge_updates=FLAGS.disable_edge_updates)
 
   model_params = dict(
       processor_factory=processor_factory,
@@ -296,13 +357,13 @@ def main(unused_argv):
 
   eval_model = clrs.models.BaselineModel(
       spec=spec,
-      dummy_trajectory=next(val_sampler),
+      dummy_trajectory=val_sampler.next(),
       **model_params
   )
   if FLAGS.chunked_training:
     train_model = clrs.models.BaselineModelChunked(
         spec=spec,
-        dummy_trajectory=next(train_sampler),
+        dummy_trajectory=train_sampler.next(),
         **model_params
         )
   else:
@@ -318,13 +379,23 @@ def main(unused_argv):
   steps = []
   next_eval = 0
 
-  while current_train_items < FLAGS.train_items:
-    feedback = next(train_sampler)
+  def _iterate_train_sampler(batch_size):
+      while True:
+          yield train_sampler.next(batch_size)
 
-    # Initialize model.
-    if current_train_items == 0:
-      t = time.time()
-      train_model.init(feedback.features, FLAGS.model_seed + 1)
+  feedback = test_sampler.next(FLAGS.eval_batch_size, eval=True)
+  t = time.time()
+  train_model.init(feedback.features, FLAGS.model_seed + 1)
+  test_sampler.reset_proc_samples()
+
+  while current_train_items < FLAGS.train_items:
+    feedback_gen = _iterate_train_sampler(FLAGS.batch_size)
+    feedback = next(feedback_gen)
+
+    # # Initialize model.
+    # if current_train_items == 0:
+    #   t = time.time()
+    #   train_model.init(feedback.features, FLAGS.seed + 1)
 
     # Training step.
     rng_key, new_rng_key = jax.random.split(rng_key)
@@ -362,6 +433,10 @@ def main(unused_argv):
         rng_key = new_rng_key
         logging.info('(train) step %d: %s', step, train_stats)
         train_scores.append(train_stats['score'])
+
+      if FLAGS.log_param_count:
+        param_count = sum(x.size for x in jax.tree_leaves(eval_model.params))
+        logging.info('Number of model parameters: %d', param_count)
 
       # Validation info.
       rng_key, new_rng_key = jax.random.split(rng_key)
@@ -405,7 +480,6 @@ def main(unused_argv):
         extras=common_extras)
     rng_key = new_rng_key
     logging.info('(test) step %d: %s', step, test_stats)
-    logging.info('test score: %.32f', test_stats['score'])
     save_stats(test_stats['score'], 'test_stats.pkl')
 
 if __name__ == '__main__':
