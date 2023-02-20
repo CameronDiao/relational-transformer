@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from clrs._src.base_modules.Basic_Transformer_jax import Basic_PT, Basic_RT
+from clrs._src.base_modules.Basic_Transformer_jax import Basic_RT
 from clrs._src.base_modules.Basic_MPNN_jax import Basic_MPNN
 from clrs._src.base_modules.Basic_GAT_jax import Basic_GAT, Basic_GATv2
 
@@ -68,56 +68,6 @@ class Processor(hk.Module):
     @property
     def inf_bias_edge(self):
         return False
-
-
-class PT(Processor):
-    def __init__(
-            self,
-            nb_layers: int,
-            nb_heads: int,
-            vec_size: int,
-            node_hid_size: int,
-            name: str = 'pt',
-    ):
-        super().__init__(name=name)
-        self.nb_layers = nb_layers
-        self.nb_heads = nb_heads
-
-        self.node_vec_size = vec_size
-        self.node_hid_size = node_hid_size
-
-        self.tfm_dropout_rate = 0.0
-
-    def __call__(
-            self,
-            node_fts: _Array,
-            edge_fts: _Array,
-            graph_fts: _Array,
-            adj_mat: _Array,
-            hidden: _Array,
-            **unused_kwargs,
-    ) -> _Array:
-        N = node_fts.shape[-2]
-        node_tensors = jnp.concatenate([node_fts, hidden], axis=-1)
-
-        node_enc = hk.Linear(self.node_vec_size)
-
-        node_tensors = node_enc(node_tensors)
-
-        layers = []
-        for l in range(self.nb_layers):
-            layers.append(Basic_PT(self.nb_heads,
-                                   self.node_vec_size,
-                                   self.node_hid_size,
-                                   self.tfm_dropout_rate,
-                                   name='{}_layer{}'.format(self.name, l)))
-        for layer in layers:
-            node_tensors = layer(node_tensors, hidden)
-
-        out_nodes = node_tensors
-
-        return out_nodes, None, None
-
 
 class RT(Processor):
     def __init__(
@@ -676,14 +626,6 @@ def get_processor_factory(kind: str,
                 edge_hid_size_2=kwargs['edge_hid_size_2'],
                 graph_vec=kwargs['graph_vec'],
                 disable_edge_updates=kwargs['disable_edge_updates'],
-                name=kind
-            )
-        elif kind == 'pt':
-            processor = PT(
-                nb_layers=kwargs['nb_layers'],
-                nb_heads=nb_heads,
-                vec_size=out_size,
-                node_hid_size=kwargs['node_hid_size'],
                 name=kind
             )
         elif kind == 'gat':
