@@ -86,6 +86,7 @@ class Sampler(abc.ABC):
     # Use `RandomState` to ensure deterministic sampling across Numpy versions.
     self._rng = np.random.RandomState(seed)
     self._num_samples = num_samples
+    self._proc_samples = 0
 
     inputs = []
     outputs = []
@@ -104,11 +105,12 @@ class Sampler(abc.ABC):
     self._outputs = _batch_io(outputs)
     self._hints, self._lengths = _batch_hints(hints)
 
-  def next(self, batch_size: Optional[int] = None) -> Feedback:
+  def next(self, batch_size: Optional[int] = None, eval = False) -> Feedback:
     """Subsamples trajectories from the pre-generated dataset.
 
     Args:
       batch_size: Optional batch size. If `None`, returns entire dataset.
+      eval: Evaluation mode. If 'True', samples from dataset in-order.
 
     Returns:
       Subsampled trajectories.
@@ -119,7 +121,15 @@ class Sampler(abc.ABC):
             f'Batch size {batch_size} > dataset size {self._num_samples}.')
 
       # Returns a fixed-size random batch.
-      indices = self._rng.choice(self._num_samples, (batch_size,), replace=True)
+      if eval:
+        if self._proc_samples + batch_size < self._num_samples:
+          indices = np.array(list(range(self._proc_samples, self._proc_samples + batch_size)))
+          self._proc_samples = self._proc_samples + batch_size
+        else:
+          indices = np.array(list(range(self._proc_samples, self._num_samples)))
+          self._proc_samples = 0
+      else:
+        indices = self._rng.choice(self._num_samples, (batch_size,), replace=True)
       inputs = _subsample_data(self._inputs, indices, axis=0)
       outputs = _subsample_data(self._outputs, indices, axis=0)
       hints = _subsample_data(self._hints, indices, axis=1)
@@ -133,6 +143,9 @@ class Sampler(abc.ABC):
       outputs = self._outputs
 
     return Feedback(Features(inputs, hints, lengths), outputs)
+
+  def reset_proc_samples(self):
+    self._proc_samples = 0
 
   @abc.abstractmethod
   def _sample_data(self, length: int, *args, **kwargs) -> List[_Array]:

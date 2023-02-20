@@ -50,7 +50,9 @@ class _MessagePassingScanState:
   diff_logits: chex.Array
   gt_diffs: chex.Array
   output_preds: chex.Array
-  hiddens: chex.Array
+  n_hiddens: chex.Array
+  e_hiddens: chex.Array
+  g_hiddens: chex.Array
   lstm_state: Optional[hk.LSTMState]
 
 
@@ -82,6 +84,7 @@ class Net(hk.Module):
       encode_hints: bool,
       decode_hints: bool,
       decode_diffs: bool,
+      ptr_from_edges: bool,
       processor_factory: processors.ProcessorFactory,
       use_lstm: bool,
       dropout_prob: float,
@@ -99,6 +102,7 @@ class Net(hk.Module):
     self.encode_hints = encode_hints
     self.decode_hints = decode_hints
     self.decode_diffs = decode_diffs
+    self.ptr_from_edges = ptr_from_edges
     self.processor_factory = processor_factory
     self.nb_dims = nb_dims
     self.use_lstm = use_lstm
@@ -165,8 +169,9 @@ class Net(hk.Module):
       for loc in [_Location.NODE, _Location.EDGE, _Location.GRAPH]:
         gt_diffs[loc] = (gt_diffs[loc] > 0.0).astype(jnp.float32) * 1.0
 
-    (hiddens, output_preds_cand, hint_preds, diff_logits,
-     lstm_state) = self._one_step_pred(inputs, cur_hint, mp_state.hiddens,
+    (n_hiddens, e_hiddens, g_hiddens, output_preds_cand, hint_preds, diff_logits,
+     lstm_state) = self._one_step_pred(inputs, cur_hint,
+                                       mp_state.n_hiddens, mp_state.e_hiddens, mp_state.g_hiddens,
                                        batch_size, nb_nodes,
                                        mp_state.lstm_state,
                                        spec, encs, decs, diff_decs)
@@ -203,7 +208,8 @@ class Net(hk.Module):
 
     new_mp_state = _MessagePassingScanState(
         hint_preds=hint_preds, diff_logits=diff_logits, gt_diffs=gt_diffs,
-        output_preds=output_preds, hiddens=hiddens, lstm_state=lstm_state)
+        output_preds=output_preds, n_hiddens=n_hiddens, e_hiddens=e_hiddens, g_hiddens=g_hiddens,
+        lstm_state=lstm_state)
 
     # Complying to jax.scan, the first returned value is the state we carry over
     # the second value is the output that will be stacked over steps.
@@ -263,7 +269,9 @@ class Net(hk.Module):
       batch_size, nb_nodes = _data_dimensions(features)
 
       nb_mp_steps = max(1, hints[0].data.shape[0] - 1)
-      hiddens = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))
+      n_hiddens = jnp.zeros((batch_size, nb_nodes, self.hidden_dim))
+      e_hiddens = jnp.zeros((batch_size, nb_nodes, nb_nodes, self.hidden_dim))
+      g_hiddens = jnp.zeros((batch_size, self.hidden_dim))
 
       if self.use_lstm:
         lstm_state = lstm_init(batch_size * nb_nodes)
@@ -275,7 +283,8 @@ class Net(hk.Module):
 
       mp_state = _MessagePassingScanState(
           hint_preds=None, diff_logits=None, gt_diffs=None,
-          output_preds=None, hiddens=hiddens, lstm_state=lstm_state)
+          output_preds=None, n_hiddens=n_hiddens, e_hiddens=e_hiddens, g_hiddens=g_hiddens,
+          lstm_state=lstm_state)
 
       # Do the first step outside of the scan because it has a different
       # computation graph.
@@ -352,6 +361,7 @@ class Net(hk.Module):
           dec[name] = decoders.construct_decoders(
               loc, t, hidden_dim=self.hidden_dim,
               nb_dims=self.nb_dims[algo_idx][name],
+              ptr_from_edges=self.ptr_from_edges,
               name=f'algo_{algo_idx}_{name}')
       encoders_.append(enc)
       decoders_.append(dec)
@@ -369,7 +379,9 @@ class Net(hk.Module):
       self,
       inputs: _Trajectory,
       hints: _Trajectory,
-      hidden: _Array,
+      n_hidden: _Array,
+      e_hidden: _Array,
+      g_hidden: _Array,
       batch_size: int,
       nb_nodes: int,
       lstm_state: Optional[hk.LSTMState],
@@ -406,51 +418,62 @@ class Net(hk.Module):
           raise Exception(f'Failed to process {dp}') from e
 
     # PROCESS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    nxt_hidden = self.processor(
+    nxt_n_hidden, nxt_e_hidden, nxt_g_hidden = self.processor(
         node_fts,
         edge_fts,
         graph_fts,
         adj_mat,
-        hidden,
+        n_hidden,
+        e_hidden=e_hidden,
+        g_hidden=g_hidden,
         batch_size=batch_size,
         nb_nodes=nb_nodes,
     )
-    nxt_hidden = hk.dropout(hk.next_rng_key(), self._dropout_prob, nxt_hidden)
+    nxt_n_hidden = hk.dropout(hk.next_rng_key(), self._dropout_prob, nxt_n_hidden)
+    if nxt_e_hidden is not None:
+      nxt_e_hidden = hk.dropout(hk.next_rng_key(), self._dropout_prob, nxt_e_hidden)
+    if nxt_g_hidden is not None:
+      nxt_g_hidden = hk.dropout(hk.next_rng_key(), self._dropout_prob, nxt_g_hidden)
 
     if self.use_lstm:
       # lstm doesn't accept multiple batch dimensions (in our case, batch and
       # nodes), so we vmap over the (first) batch dimension.
-      nxt_hidden, nxt_lstm_state = jax.vmap(self.lstm)(nxt_hidden, lstm_state)
+      nxt_n_hidden, nxt_lstm_state = jax.vmap(self.lstm)(nxt_n_hidden, lstm_state)
     else:
       nxt_lstm_state = None
 
-    h_t = jnp.concatenate([node_fts, hidden, nxt_hidden], axis=-1)
+    h_n_t = jnp.concatenate([node_fts, n_hidden, nxt_n_hidden], axis=-1)
+    if nxt_e_hidden is not None:
+      h_e_t = jnp.concatenate([edge_fts, e_hidden, nxt_e_hidden], axis=-1)
+    if nxt_g_hidden is not None:
+      h_g_t = jnp.concatenate([graph_fts, g_hidden, nxt_g_hidden], axis=-1)
 
     # DECODE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Decode features and (optionally) hints.
     hint_preds, output_preds = decoders.decode_fts(
         decoders=decs,
         spec=spec,
-        h_t=h_t,
+        h_t=h_n_t,
         adj_mat=adj_mat,
-        edge_fts=edge_fts,
-        graph_fts=graph_fts,
+        edge_fts=h_e_t if nxt_e_hidden is not None else edge_fts,
+        graph_fts=h_g_t if nxt_g_hidden is not None else graph_fts,
         inf_bias=self.processor.inf_bias,
         inf_bias_edge=self.processor.inf_bias_edge,
+        ptr_from_edges=self.ptr_from_edges
     )
 
     # Optionally decode diffs.
     diff_preds = decoders.maybe_decode_diffs(
         diff_decoders=diff_decs,
-        h_t=h_t,
-        edge_fts=edge_fts,
-        graph_fts=graph_fts,
+        h_t=h_n_t,
+        edge_fts=h_e_t if nxt_e_hidden is not None else edge_fts,
+        graph_fts=h_g_t if nxt_g_hidden is not None else graph_fts,
         batch_size=batch_size,
         nb_nodes=nb_nodes,
         decode_diffs=self.decode_diffs,
     )
 
-    return nxt_hidden, output_preds, hint_preds, diff_preds, nxt_lstm_state
+    return nxt_n_hidden, nxt_e_hidden, nxt_g_hidden, output_preds, hint_preds, diff_preds, nxt_lstm_state
 
 
 class NetChunked(Net):

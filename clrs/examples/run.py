@@ -18,6 +18,7 @@
 import os
 import shutil
 import time
+import pickle
 from absl import app
 from absl import flags
 from absl import logging
@@ -28,13 +29,12 @@ import jax.numpy as jnp
 import requests
 import tensorflow as tf
 
+flags.DEFINE_string('algorithm', 'jarvis_march', 'Which algorithm to run.')
+flags.DEFINE_integer('model_seed', 42, 'Seed model initialization.')
 
-flags.DEFINE_string('algorithm', 'bfs', 'Which algorithm to run.')
-flags.DEFINE_integer('seed', 42, 'Random seed to set')
-
-flags.DEFINE_integer('batch_size', 32, 'Batch size used for training.')
-flags.DEFINE_boolean('chunked_training', False,
-                     'Whether to use chunking for training.')
+flags.DEFINE_integer('batch_size', 4, 'Batch size used for training.')
+flags.DEFINE_string('chunked_training', 'False',
+                    'Whether to use chunking for training.')
 flags.DEFINE_integer('chunk_length', 100,
                      'Time chunk length used for training (if '
                      '`chunked_training` is True.')
@@ -47,18 +47,28 @@ flags.DEFINE_integer('train_items', 320000,
                      'many full examples.')
 flags.DEFINE_integer('eval_every', 320,
                      'Logging frequency (in training examples).')
-flags.DEFINE_boolean('verbose_logging', False, 'Whether to log aux losses.')
+flags.DEFINE_string('eval_on_train_set', 'True',
+                    'Whether to evaluate the model on the training dataset.')
+flags.DEFINE_string('eval_on_test_set', 'True',
+                    'Whether to evaluate the model on the test dataset.')
+flags.DEFINE_string('verbose_logging', 'False', 'Whether to log aux losses.')
+flags.DEFINE_string('ptr_from_edges', 'True', 'Whether to decode pointers directly from edge vectors.')
 
-flags.DEFINE_integer('hidden_size', 128,
+flags.DEFINE_integer('num_layers', 3, 'Number of processor layers.')
+flags.DEFINE_integer('hidden_size', 0,
                      'Number of hidden size units of the model.')
-flags.DEFINE_float('learning_rate', 0.001, 'Learning rate to use.')
+flags.DEFINE_float('learning_rate', 0.00025, 'Learning rate to use.')
 flags.DEFINE_float('dropout_prob', 0.0, 'Dropout rate to use.')
 flags.DEFINE_float('hint_teacher_forcing_noise', 0.5,
                    'Probability that rematerialized hints are encoded during '
                    'training instead of ground-truth teacher hints. Only '
                    'pertinent in encoded_decoded modes.')
-flags.DEFINE_integer('nb_heads', 1, 'Number of heads for GAT processors')
+flags.DEFINE_integer('nb_heads', 12, 'Number of heads for GAT processors.')
+flags.DEFINE_integer('head_size', 16, 'Size of each attention head (overrides hidden_size for GAT/RT processors.')
 
+flags.DEFINE_integer('node_hid_size', 32, 'Hidden size of node processors.')
+flags.DEFINE_integer('edge_hid_size_1', 16, 'First hidden size of edge processors.')
+flags.DEFINE_integer('edge_hid_size_2', 8, 'Second hidden size of edge processors.')
 flags.DEFINE_enum('hint_mode', 'encoded_decoded_nodiff',
                   ['encoded_decoded', 'decoded_only',
                    'encoded_decoded_nodiff', 'decoded_only_nodiff',
@@ -78,23 +88,25 @@ flags.DEFINE_enum('hint_mode', 'encoded_decoded_nodiff',
                   'try to predict all hint values instead of just the values '
                   'that change from one timestep to the next.')
 
-flags.DEFINE_boolean('use_ln', True,
-                     'Whether to use layer normalisation in the processor.')
-flags.DEFINE_boolean('use_lstm', False,
-                     'Whether to insert an LSTM after message passing.')
+flags.DEFINE_string('use_ln', 'True',
+                    'Whether to use layer normalisation in the processor.')
+flags.DEFINE_string('use_lstm', 'False',
+                    'Whether to insert an LSTM after message passing.')
+flags.DEFINE_enum('graph_vec', 'cat',
+                  ['att', 'core', 'cat'], 'How to process the graph representations.')
 flags.DEFINE_enum(
-    'processor_type', 'mpnn',
-    ['deepsets', 'mpnn', 'pgn', 'pgn_mask',
-     'gat', 'gatv2', 'gat_full', 'gatv2_full',
-     'memnet_full', 'memnet_masked'],
-    'The processor type to use.')
+   'processor_type', 'rt',
+   ['deepsets', 'rt', 'mpnn', 'pgn', 'pgn_mask',
+    'gat', 'gatv2', 'gat_full', 'gatv2_full',
+    'memnet_full', 'memnet_masked'],
+   'The processor type to use.')
 
 flags.DEFINE_string('checkpoint_path', '/tmp/CLRS30',
                     'Path in which checkpoints are saved.')
 flags.DEFINE_string('dataset_path', '/tmp/CLRS30',
                     'Path in which dataset is stored.')
-flags.DEFINE_boolean('freeze_processor', False,
-                     'Whether to freeze the processor of the model.')
+flags.DEFINE_string('freeze_processor', 'False',
+                    'Whether to freeze the processor of the model.')
 
 FLAGS = flags.FLAGS
 
@@ -190,11 +202,26 @@ def maybe_download_dataset():
   return dataset_folder
 
 
+def save_stats(obj, filename):
+    path = os.path.join(FLAGS.checkpoint_path, filename)
+    with open(path, 'wb') as outp:
+        pickle.dump(obj, outp, pickle.HIGHEST_PROTOCOL)
+
 def main(unused_argv):
   # Use canonical CLRS-30 samplers.
-  clrs30_spec = clrs.CLRS30
-  logging.info('Using CLRS30 spec: %s', clrs30_spec)
   dataset_folder = maybe_download_dataset()
+
+  FLAGS.chunked_training = eval(FLAGS.chunked_training)
+  FLAGS.eval_on_train_set = eval(FLAGS.eval_on_train_set)
+  FLAGS.eval_on_test_set = eval(FLAGS.eval_on_test_set)
+  FLAGS.verbose_logging = eval(FLAGS.verbose_logging)
+  FLAGS.ptr_from_edges = eval(FLAGS.ptr_from_edges)
+  FLAGS.use_ln = eval(FLAGS.use_ln)
+  FLAGS.use_lstm = eval(FLAGS.use_lstm)
+  FLAGS.freeze_processor = eval(FLAGS.freeze_processor)
+
+  if 'rt' in FLAGS.processor_type or 'gat' in FLAGS.processor_type:
+    FLAGS.hidden_size = FLAGS.nb_heads * FLAGS.head_size
 
   if FLAGS.hint_mode == 'encoded_decoded_nodiff':
     encode_hints = True
@@ -244,13 +271,21 @@ def main(unused_argv):
 
   processor_factory = clrs.get_processor_factory(FLAGS.processor_type,
                                                  use_ln=FLAGS.use_ln,
-                                                 nb_heads=FLAGS.nb_heads)
+                                                 nb_layers=FLAGS.num_layers,
+                                                 nb_heads=FLAGS.nb_heads,
+                                                 node_hid_size=FLAGS.node_hid_size,
+                                                 edge_hid_size_1=FLAGS.edge_hid_size_1,
+                                                 edge_hid_size_2=FLAGS.edge_hid_size_2,
+                                                 disable_edge_updates=FLAGS.ptr_from_edges,
+                                                 graph_vec=FLAGS.graph_vec)
+
   model_params = dict(
       processor_factory=processor_factory,
       hidden_dim=FLAGS.hidden_size,
       encode_hints=encode_hints,
       decode_hints=decode_hints,
       decode_diffs=decode_diffs,
+      ptr_from_edges=FLAGS.ptr_from_edges,
       use_lstm=FLAGS.use_lstm,
       learning_rate=FLAGS.learning_rate,
       checkpoint_path=FLAGS.checkpoint_path,
@@ -275,9 +310,12 @@ def main(unused_argv):
 
   # Training loop.
   best_score = -1.0  # Ensure that there is overwriting
-  rng_key = jax.random.PRNGKey(FLAGS.seed)
+  train_scores = []
+  val_scores = []
+  rng_key = jax.random.PRNGKey(FLAGS.model_seed)
   current_train_items = 0
   step = 0
+  steps = []
   next_eval = 0
 
   while current_train_items < FLAGS.train_items:
@@ -286,9 +324,9 @@ def main(unused_argv):
     # Initialize model.
     if current_train_items == 0:
       t = time.time()
-      train_model.init(feedback.features, FLAGS.seed + 1)
+      train_model.init(feedback.features, FLAGS.model_seed + 1)
 
-    # Training step step.
+    # Training step.
     rng_key, new_rng_key = jax.random.split(rng_key)
     cur_loss = train_model.feedback(rng_key, feedback)
     rng_key = new_rng_key
@@ -302,25 +340,28 @@ def main(unused_argv):
 
     # Periodically evaluate model.
     if current_train_items >= next_eval:
+      steps.append(step)
       common_extras = {'examples_seen': current_train_items,
                        'step': step}
       eval_model.params = train_model.params
       # Training info.
-      if FLAGS.chunked_training:
-        train_feedback = next(train_sampler_for_eval)
-      else:
-        train_feedback = feedback
-      rng_key, new_rng_key = jax.random.split(rng_key)
-      train_stats = evaluate(
-          rng_key,
-          eval_model,
-          train_feedback,
-          spec=spec,
-          extras=dict(loss=cur_loss, **common_extras),
-          verbose=FLAGS.verbose_logging,
-      )
-      rng_key = new_rng_key
-      logging.info('(train) step %d: %s', step, train_stats)
+      if FLAGS.eval_on_train_set:
+        if FLAGS.chunked_training:
+          train_feedback = next(train_sampler_for_eval)
+        else:
+          train_feedback = feedback
+        rng_key, new_rng_key = jax.random.split(rng_key)
+        train_stats = evaluate(
+            rng_key,
+            eval_model,
+            train_feedback,
+            spec=spec,
+            extras=dict(loss=cur_loss, **common_extras),
+            verbose=FLAGS.verbose_logging,
+        )
+        rng_key = new_rng_key
+        logging.info('(train) step %d: %s', step, train_stats)
+        train_scores.append(train_stats['score'])
 
       # Validation info.
       rng_key, new_rng_key = jax.random.split(rng_key)
@@ -333,6 +374,7 @@ def main(unused_argv):
           extras=common_extras)
       rng_key = new_rng_key
       logging.info('(val) step %d: %s', step, val_stats)
+      val_scores.append(val_stats['score'])
 
       # If best scores, update checkpoint.
       score = val_stats['score']
@@ -344,21 +386,27 @@ def main(unused_argv):
 
     step += 1
 
+  save_stats(steps, 'steps.pkl')
+  save_stats(train_scores, 'train_stats.pkl')
+  save_stats(val_scores, 'val_stats.pkl')
+
   # Training complete, evaluate on test set.
-  logging.info('Restoring best model from checkpoint...')
-  eval_model.restore_model('best.pkl', only_load_processor=False)
+  if FLAGS.eval_on_test_set:
+    logging.info('Restoring best model from checkpoint...')
+    eval_model.restore_model('best.pkl', only_load_processor=False)
 
-  rng_key, new_rng_key = jax.random.split(rng_key)
-  test_stats = collect_and_eval(
-      test_sampler,
-      eval_model.predict,
-      test_samples,
-      rng_key,
-      spec=spec,
-      extras=common_extras)
-  rng_key = new_rng_key
-  logging.info('(test) step %d: %s', step, test_stats)
-
+    rng_key, new_rng_key = jax.random.split(rng_key)
+    test_stats = collect_and_eval(
+        test_sampler,
+        eval_model.predict,
+        test_samples,
+        rng_key,
+        spec=spec,
+        extras=common_extras)
+    rng_key = new_rng_key
+    logging.info('(test) step %d: %s', step, test_stats)
+    logging.info('test score: %.32f', test_stats['score'])
+    save_stats(test_stats['score'], 'test_stats.pkl')
 
 if __name__ == '__main__':
   app.run(main)

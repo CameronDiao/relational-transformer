@@ -91,8 +91,11 @@ def output_loss(truth: _DataPoint, pred: _Array, nb_nodes: int) -> float:
     total_loss = jnp.sum(loss * mask) / jnp.sum(mask)
 
   elif truth.type_ in [_Type.MASK_ONE, _Type.CATEGORICAL]:
+    #unmasked_data = truth.data[truth.data == _OutputClass.POSITIVE]
     masked_truth = truth.data * (truth.data != _OutputClass.MASKED).astype(
         jnp.float32)
+    #total_loss = (-jnp.sum(masked_truth * jax.nn.log_softmax(pred)) /
+    #              jnp.sum(unmasked_data))
     total_loss = (-jnp.sum(masked_truth * jax.nn.log_softmax(pred)) /
                   jnp.sum(truth.data == _OutputClass.POSITIVE))
 
