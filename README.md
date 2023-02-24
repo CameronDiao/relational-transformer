@@ -35,7 +35,7 @@ python3 -m clrs.examples.run
 Or, for a short test run, you can specify:
 
 ```shell
-python 3 -m clrs.examples.run --train_items 320
+python3 -m clrs.examples.run --train_items 320
 ```
 
 Run hyperparameters are set in `run.py` and can be overridden on the command line. The hyperparameters
