@@ -27,14 +27,14 @@ flags.DEFINE_string('chunked_training', 'False',
 flags.DEFINE_integer('chunk_length', 100,
                      'Time chunk length used for training (if '
                      '`chunked_training` is True.')
-flags.DEFINE_integer('train_items', 320,
+flags.DEFINE_integer('train_items', 320000,
                      'Number of items (i.e., individual examples, possibly '
                      'repeated) processed during training. With non-chunked'
                      'training, this is the number of training batches times '
                      'the number of training steps. For chunked training, '
                      'as many chunks will be processed as needed to get these '
                      'many full examples.')
-flags.DEFINE_integer('train_size', 320000,
+flags.DEFINE_integer('train_size', 10000,
                       'Number of samples in the training set.')
 flags.DEFINE_integer('valid_size', 32,
                      'Number of samples in the validation set.')
@@ -53,19 +53,19 @@ flags.DEFINE_string('disable_edge_updates', 'False', 'Whether to disable edge up
 
 flags.DEFINE_integer('num_layers', 3, 'Number of processor layers.')
 flags.DEFINE_integer('hidden_size', 0,
-                     'Number of hidden size units of the model.')
+                     'Node vector size (d_\{n\} = d_\{e\} = d_\{g\} in the paper). Ignored by models that use attention heads.')
 flags.DEFINE_float('learning_rate', 0.00025, 'Learning rate to use.')
 flags.DEFINE_float('dropout_prob', 0.0, 'Dropout rate to use.')
 flags.DEFINE_float('hint_teacher_forcing_noise', 0.5,
                    'Probability that rematerialized hints are encoded during '
                    'training instead of ground-truth teacher hints. Only '
                    'pertinent in encoded_decoded modes.')
-flags.DEFINE_integer('nb_heads', 12, 'Number of heads for GAT processors.')
+flags.DEFINE_integer('nb_heads', 12, 'Number of attention heads.')
 flags.DEFINE_integer('head_size', 16, 'Size of each attention head (overrides hidden_size for GAT/RT processors.')
 
-flags.DEFINE_integer('node_hid_size', 32, 'Hidden size of node processors.')
-flags.DEFINE_integer('edge_hid_size_1', 16, 'First hidden size of edge processors.')
-flags.DEFINE_integer('edge_hid_size_2', 8, 'Second hidden size of edge processors.')
+flags.DEFINE_integer('node_hid_size', 32, 'Hidden size of node processors (d_\{nh\} in the paper).')
+flags.DEFINE_integer('edge_hid_size_1', 16, 'First hidden size of edge processors (d_\{eh1\} in the paper).')
+flags.DEFINE_integer('edge_hid_size_2', 8, 'Second hidden size of edge processors (d_\{eh2\} in the paper).')
 flags.DEFINE_enum('hint_mode', 'encoded_decoded_nodiff',
                   ['encoded_decoded', 'decoded_only',
                    'encoded_decoded_nodiff', 'decoded_only_nodiff',
@@ -256,6 +256,8 @@ def main(unused_argv):
   #                   algorithm=FLAGS.algorithm,
   #                   batch_size=FLAGS.batch_size)
   # Make full dataset pipeline run on CPU (including prefetching).
+
+  logging.info('Generating datasets... (this can take up to 10 minutes)')
   with tf.device('/cpu:0'):
     if FLAGS.chunked_training:
       train_sampler, spec = clrs.create_chunked_dataset(
