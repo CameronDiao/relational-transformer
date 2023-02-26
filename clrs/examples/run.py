@@ -329,8 +329,9 @@ def main(unused_argv):
         length=64
     )
 
-    logging.info('train_samples: {}, val samples: {}, test samples: {}'.format(FLAGS.train_size,
-        val_samples, test_samples))
+    logging.info('Training Set Size: {}, Validation Set Size: {}, Test Set Size: {}'.format(
+      FLAGS.train_size, val_samples, test_samples))
+    logging.info('Number of samples to be processed during training: {}'.format(FLAGS.train_items))
 
   processor_factory = clrs.get_processor_factory(FLAGS.processor_type,
                                                  use_ln=FLAGS.use_ln,
